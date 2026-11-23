@@ -1,0 +1,18 @@
+{
+  "discord-session-bind": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./hooks/session-bind.sh",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./hooks/session-bind.sh",
+        "timeout": 5
+      }
+    ]
+  }
+}

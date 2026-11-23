@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "discord": {
+      "command": "./bin/agy-discord-mcp"
+    }
+  }
+}

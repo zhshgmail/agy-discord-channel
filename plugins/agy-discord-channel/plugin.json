@@ -1,0 +1,14 @@
+{
+  "name": "agy-discord-channel",
+  "displayName": "AGY Discord Channel",
+  "version": "0.1.0",
+  "description": "Claude-Code-style session-bound Discord bot channel for Google Antigravity CLI (agy) across DMs, guild channels, and threads.",
+  "logo": "assets/logo.svg",
+  "license": "MIT",
+  "homepage": "https://github.com/zhshgmail/agy-discord-channel",
+  "repository": "https://github.com/zhshgmail/agy-discord-channel",
+  "author": {
+    "name": "zhshgmail",
+    "url": "https://github.com/zhshgmail"
+  }
+}
