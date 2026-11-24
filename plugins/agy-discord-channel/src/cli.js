@@ -126,14 +126,54 @@ function extractNewDiscordBanners(transcriptPath, tuiEchoStatePath) {
   return banners;
 }
 
+function buildHookResponse(payload = {}, env = process.env, pluginRoot = path.resolve(__dirname, '..')) {
+  const config = loadConfig(env);
+  const bindRes = recordHookSessionBind(config.paths, payload, env);
+  const injectSteps = [];
+
+  const eventName = String(payload?.hookEventName || '');
+  if (eventName === 'PreInvocation' && payload?.transcriptPath) {
+    const banners = extractNewDiscordBanners(payload.transcriptPath, config.paths.tuiEchoStatePath);
+    if (banners.length > 0) {
+      injectSteps.push({
+        systemMessage: {
+          systemMessage: '',
+          metadata: {
+            user_markdown: banners.join('\n\n'),
+          },
+        },
+      });
+    }
+  }
+
+  if (
+    (eventName === 'SessionStart' || eventName === 'PreInvocation') &&
+    bindRes.recorded &&
+    (!bindRes.record?.lsAddress || !bindRes.record?.csrfToken)
+  ) {
+    const bindHelper = path.join(pluginRoot, 'bin', 'agy-discord');
+    injectSteps.push({
+      systemMessage: {
+        systemMessage:
+          `[agy-discord-channel] Language Server credentials are not bound yet for this agy session ` +
+          `(inbound Discord push delivery is waiting). Run \`${bindHelper} bind-hook </dev/null\` ` +
+          `once via \`run_command\` in this turn to bind LS credentials.`,
+      },
+    });
+  }
+
+  return injectSteps.length > 0 ? { injectSteps } : {};
+}
+
 function runBindHook(env = process.env) {
+  let out = {};
   try {
     const raw = readStdinSync().trim();
     const payload = raw ? JSON.parse(raw) : {};
-    const config = loadConfig(env);
-    recordHookSessionBind(config.paths, payload, env);
+    const pluginRoot = env.PLUGIN_ROOT || path.resolve(__dirname, '..');
+    out = buildHookResponse(payload, env, pluginRoot);
   } catch {}
-  process.stdout.write('{}\n');
+  process.stdout.write(`${JSON.stringify(out)}\n`);
 }
 
 function formatStatusReport(config) {
@@ -483,6 +523,7 @@ function main(argv = process.argv.slice(2)) {
 }
 
 module.exports = {
+  buildHookResponse,
   extractNewDiscordBanners,
   formatStatusReport,
   main,

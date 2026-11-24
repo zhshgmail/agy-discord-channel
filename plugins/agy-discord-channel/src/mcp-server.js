@@ -5,7 +5,7 @@ const { loadConfig } = require('./config');
 const { createDiscordService } = require('./discord-gateway');
 
 const SERVER_NAME = 'agy-discord-channel';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '0.2.0';
 
 function makeLogger() {
   return (level, message, meta) => {
@@ -29,7 +29,8 @@ function toolDefinitions() {
           },
           text: {
             type: 'string',
-            description: 'Message text to send (auto-splits if > 2000 chars).',
+            description:
+              'Message text to send (auto-splits if > 2000 chars; optional when files is non-empty). Keep < 1800 chars when waking peer bots with <@USER_ID> so split chunks do not drop mentions.',
           },
           reply_to: {
             type: 'string',
@@ -45,7 +46,7 @@ function toolDefinitions() {
             description: 'Set true when sending an additional reply to a message already answered.',
           },
         },
-        required: ['chat_id', 'text'],
+        required: ['chat_id'],
       },
     },
     {
@@ -101,12 +102,30 @@ function toolDefinitions() {
     {
       name: 'download_attachment',
       description:
-        'Download all attachments from a specific Discord message into the local inbox directory and return local file paths.',
+        'Download attachments from a specific Discord message into the local inbox directory (or optional save_dir) and return local file paths, sizes, and SHA-256 digests.',
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          message_id: { type: 'string' },
+          chat_id: {
+            type: 'string',
+            description: 'Discord channel, thread, or DM snowflake ID.',
+          },
+          message_id: {
+            type: 'string',
+            description: 'Discord message snowflake ID containing the attachment(s).',
+          },
+          save_dir: {
+            type: 'string',
+            description: 'Optional destination directory path (defaults to <stateDir>/inbox).',
+          },
+          attachment_id: {
+            type: 'string',
+            description: 'Optional specific attachment ID filter.',
+          },
+          filename: {
+            type: 'string',
+            description: 'Optional exact attachment filename filter.',
+          },
         },
         required: ['chat_id', 'message_id'],
       },
@@ -192,6 +211,9 @@ async function executeTool(service, name, rawArgs = {}) {
       const text = await service.downloadMessageAttachments({
         chatId: args.chat_id || args.channel_id,
         messageId: args.message_id || args.messageId,
+        saveDir: args.save_dir || args.saveDir || args.dest_dir,
+        attachmentId: args.attachment_id || args.attachmentId,
+        filename: args.filename,
       });
       return { content: [{ type: 'text', text }] };
     }

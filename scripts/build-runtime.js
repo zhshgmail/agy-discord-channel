@@ -82,7 +82,12 @@ async function buildBundle({ entryPoint, label, outputPath }) {
       .filter((spec) => !spec.startsWith('node:'));
 
     assert.deepEqual(externals, [], `${label} bundle has unexpected external deps: ${externals.join(', ')}`);
-    return fs.readFileSync(tempOut);
+    const rawText = fs.readFileSync(tempOut, 'utf8');
+    const normalizedText = rawText.replace(
+      /^(\/\/\s+|\s*")(?:\.\.\/)+[^"\n]*?\/node_modules\//gm,
+      '$1node_modules/',
+    );
+    return Buffer.from(normalizedText, 'utf8');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

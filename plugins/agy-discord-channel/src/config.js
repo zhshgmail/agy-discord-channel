@@ -102,6 +102,11 @@ function loadConfig(inputEnv = process.env) {
     ''
   ).trim();
 
+  const uploadModeRaw = (env.DISCORD_UPLOAD_MODE || 'auto').trim().toLowerCase();
+  const uploadMode = ['auto', 'cloud', 'multipart'].includes(uploadModeRaw)
+    ? uploadModeRaw
+    : 'auto';
+
   return {
     rawInputEnv,
     reload: () => loadConfig(rawInputEnv),
@@ -119,6 +124,10 @@ function loadConfig(inputEnv = process.env) {
     staticAccess: env.DISCORD_ACCESS_MODE === 'static',
     drainIntervalMs: parseInteger(env.AGY_DISCORD_DRAIN_INTERVAL_MS, 1000),
     envPollIntervalMs: parseInteger(env.AGY_DISCORD_ENV_POLL_MS, 3000),
+    restTimeoutMs: Math.max(5000, parseInteger(env.DISCORD_REST_TIMEOUT_MS, 45000)),
+    restRetries: Math.max(0, Math.min(parseInteger(env.DISCORD_REST_RETRIES, 2), 5)),
+    transferTimeoutMs: Math.max(5000, parseInteger(env.DISCORD_TRANSFER_TIMEOUT_MS, 60000)),
+    uploadMode,
   };
 }
 

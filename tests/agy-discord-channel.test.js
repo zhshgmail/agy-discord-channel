@@ -1,7 +1,9 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -36,11 +38,17 @@ const {
 } = require('../plugins/agy-discord-channel/src/session-route');
 const {
   assertSendableFile,
+  assertWritableDownloadDir,
   chunkText,
   createDiscordService,
+  inferMimeType,
+  sanitizeAttachmentFilename,
 } = require('../plugins/agy-discord-channel/src/discord-gateway');
 const { handleJsonRpcMessage } = require('../plugins/agy-discord-channel/src/mcp-server');
-const { extractNewDiscordBanners } = require('../plugins/agy-discord-channel/src/cli');
+const {
+  buildHookResponse,
+  extractNewDiscordBanners,
+} = require('../plugins/agy-discord-channel/src/cli');
 
 function makeTempState() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-discord-test-'));
@@ -440,6 +448,38 @@ test('gateway + MCP: end-to-end inbound multi-thread delivery, chunking, exfil g
       react: async () => {},
     });
 
+    // Inbound 1b: Peer bot quote-replies WITHOUT <@my-bot-id> in content, even though Discord sets mentions.users!
+    let unmentionedBotReplyReacted = false;
+    await service.handleInboundMessage({
+      id: 'in-thread-1b',
+      channelId: 'thread-99',
+      guildId: 'guild-1',
+      content: 'Verification passed, no need to reply.',
+      reference: { messageId: 'out-prev' },
+      fetchReference: async () => ({ id: 'out-prev', author: { id: 'my-bot-id' } }),
+      author: { id: 'bot-peer', username: 'ClaudeBlue', bot: true },
+      channel: {
+        type: 11,
+        name: 'kernel-opt-thread',
+        parentId: 'chan-main',
+        isThread: () => true,
+        sendTyping: async () => {},
+      },
+      mentions: {
+        everyone: false,
+        // Discord gateway populates mentions.users with repliedUser on native quote-replies!
+        users: new Map([['my-bot-id', true]]),
+        repliedUser: { id: 'my-bot-id' },
+        roles: new Map(),
+      },
+      attachments: new Map(),
+      createdAt: new Date('2026-11-23T19:05:02Z'),
+      react: async () => {
+        unmentionedBotReplyReacted = true;
+      },
+    });
+    assert.equal(unmentionedBotReplyReacted, false, 'Must not react or ingest unmentioned bot quote-reply');
+
     // Inbound 2: Direct Message from allowlisted human -> SAME session!
     await service.handleInboundMessage({
       id: 'in-dm-2',
@@ -523,6 +563,46 @@ test('cli PreInvocation hook: extracts unseen Discord <channel> blocks into TUI 
     // Second invocation does not re-emit already echoed message_id
     const b2 = extractNewDiscordBanners(transcript, paths.tuiEchoStatePath);
     assert.equal(b2.length, 0);
+
+    // buildHookResponse injects LS bind prompt when lsAddress/csrfToken missing
+    const convId = '00000000-1111-4222-8333-444444444444';
+    const unboundOut = buildHookResponse(
+      {
+        conversationId: convId,
+        hookEventName: 'PreInvocation',
+        transcriptPath: transcript,
+      },
+      { HOME: dir, DISCORD_STATE_DIR: paths.stateDir },
+      '/opt/plugin',
+    );
+    assert.equal(unboundOut.injectSteps.length, 1);
+    assert.match(unboundOut.injectSteps[0].systemMessage.systemMessage, /bind-hook/);
+
+    // Once LS credentials are bound, buildHookResponse emits TUI banner for new Discord message and no bind prompt
+    const step2 = {
+      step_index: 11,
+      source: 'SYSTEM',
+      type: 'SYSTEM_MESSAGE',
+      content:
+        '<SYSTEM_MESSAGE>\n<channel source="discord" chat_id="1500001" channel_name="DM" message_id="m-778" user="bob" is_bot="false">\nhi again\n</channel>\n</SYSTEM_MESSAGE>',
+    };
+    fs.appendFileSync(transcript, `${JSON.stringify(step2)}\n`);
+    const boundOut = buildHookResponse(
+      {
+        conversationId: convId,
+        hookEventName: 'PreInvocation',
+        transcriptPath: transcript,
+      },
+      {
+        HOME: dir,
+        DISCORD_STATE_DIR: paths.stateDir,
+        ANTIGRAVITY_LS_ADDRESS: 'localhost:40585',
+        ANTIGRAVITY_CSRF_TOKEN: 'secret-token',
+      },
+      '/opt/plugin',
+    );
+    assert.equal(boundOut.injectSteps.length, 1);
+    assert.match(boundOut.injectSteps[0].systemMessage.metadata.user_markdown, /hi again/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -624,6 +704,420 @@ test('codex-hardened safeguards: ANSI escape sanitization, stale backlog archiva
 
     await svc.shutdown();
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('attachments: 2-step Cloud Attachments upload (58KB .md + retry + file-only), multipart fallback, and validation guards', async () => {
+  const { dir, paths } = makeTempState();
+  let server = null;
+  try {
+    saveEnvKey(paths.envFile, 'DISCORD_BOT_TOKEN', 'fake-token');
+    saveAccessState(paths.accessPath, {
+      dmPolicy: 'allowlist',
+      allowBots: true,
+      allowFrom: ['human-1'],
+      groups: { 'chan-1': { requireMention: true, allowBots: true, allowFrom: [] } },
+    });
+
+    const putRequests = [];
+    let failFirstPut = true;
+
+    server = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        const body = Buffer.concat(chunks);
+        if (req.method === 'PUT' && req.url.startsWith('/upload/')) {
+          putRequests.push({
+            url: req.url,
+            contentType: req.headers['content-type'],
+            bytes: body,
+          });
+          if (failFirstPut) {
+            failFirstPut = false;
+            res.writeHead(503, { 'content-type': 'text/plain' });
+            res.end('transient storage error');
+            return;
+          }
+          res.writeHead(200);
+          res.end('');
+          return;
+        }
+        res.writeHead(404);
+        res.end('not found');
+      });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    const restPosts = [];
+    const fallbackSends = [];
+    let forceCloudReserveError = false;
+    let configuredRestOpts = null;
+
+    class CloudCapableClient {
+      constructor(opts) {
+        configuredRestOpts = opts?.rest || null;
+        this.user = { id: 'bot-1', tag: 'Bot#1' };
+        this.rest = {
+          post: async (route, req) => {
+            restPosts.push({ route, body: req.body });
+            if (route.endsWith('/attachments')) {
+              if (forceCloudReserveError) {
+                throw new Error('simulated cloud attachments endpoint failure');
+              }
+              return {
+                attachments: req.body.files.map((f) => ({
+                  id: f.id,
+                  upload_url: `http://127.0.0.1:${port}/upload/${f.id}/${encodeURIComponent(f.filename)}`,
+                  upload_filename: `gcs-bucket/${f.id}-${f.filename}`,
+                })),
+              };
+            }
+            if (route.endsWith('/messages')) {
+              return { id: `cloud-msg-${restPosts.length}` };
+            }
+            throw new Error(`Unexpected REST route: ${route}`);
+          },
+        };
+        this.channels = {
+          fetch: async (id) => ({
+            id,
+            name: id === 'dm-1' ? 'DM' : 'chan-1',
+            guildId: id === 'dm-1' ? null : 'g-1',
+            type: id === 'dm-1' ? 1 : 0,
+            recipientId: id === 'dm-1' ? 'human-1' : null,
+            isTextBased: () => true,
+            isThread: () => false,
+            send: async (payload) => {
+              const outId = `fallback-msg-${fallbackSends.length + 1}`;
+              fallbackSends.push({ id, outId, payload });
+              return { id: outId };
+            },
+          }),
+        };
+      }
+      on() {}
+      async login() {
+        return 'ok';
+      }
+      async destroy() {}
+    }
+
+    const cfg = loadConfig({
+      HOME: dir,
+      DISCORD_STATE_DIR: paths.stateDir,
+      DISCORD_REST_TIMEOUT_MS: '45000',
+      DISCORD_TRANSFER_TIMEOUT_MS: '15000',
+    });
+    const svc = createDiscordService({
+      initialConfig: cfg,
+      logger: () => {},
+      deps: {
+        ownerAgy: null,
+        discord: {
+          Client: CloudCapableClient,
+          Events: { ClientReady: 'ready', MessageCreate: 'messageCreate' },
+          GatewayIntentBits: { DirectMessages: 1, Guilds: 2, GuildMessages: 4, MessageContent: 8 },
+          Partials: { Channel: 1 },
+        },
+        resolveSessionRoute: () => ({
+          ready: true,
+          conversationId: '056d4d74-ec64-49e0-a690-8eadf717a570',
+        }),
+      },
+    });
+    await svc.tryConnectGateway();
+    assert.equal(configuredRestOpts.timeout, 45000, 'Client must configure generous REST timeout');
+
+    // 1. 58 KB Markdown upload via 2-step Cloud Attachments (with transient 503 retry on PUT!)
+    const mdPath = path.join(dir, 'ARCHITECTURE_ANALYSIS_58KB.md');
+    const mdContent = `# Architecture Analysis\n\n${'Optimization details line.\n'.repeat(2200)}`;
+    fs.writeFileSync(mdPath, mdContent, 'utf8');
+    const expectedBytes = fs.readFileSync(mdPath);
+    assert.ok(expectedBytes.length > 58000);
+
+    const rpcOut = [];
+    await handleJsonRpcMessage(
+      svc,
+      {
+        jsonrpc: '2.0',
+        id: 10,
+        method: 'tools/call',
+        params: {
+          name: 'reply',
+          arguments: {
+            chat_id: 'dm-1',
+            reply_to: 'in-msg-1',
+            text: 'Here is the 58KB report.',
+            files: [mdPath],
+            followup: true,
+          },
+        },
+      },
+      (m) => rpcOut.push(m),
+    );
+    assert.equal(rpcOut[0].result.isError, undefined);
+    assert.match(rpcOut[0].result.content[0].text, /^sent \(id: cloud-msg-\d+, attachments: 1\)$/);
+    assert.equal(putRequests.length, 2, 'First 503 PUT must retry automatically and succeed');
+    assert.equal(Buffer.compare(putRequests[1].bytes, expectedBytes), 0, 'Uploaded bytes must match file 100%');
+    assert.match(putRequests[1].contentType, /^text\/markdown/);
+    assert.equal(fallbackSends.length, 0, 'Cloud Attachments path should not hit legacy multipart send');
+
+    const msgPost = restPosts.find((p) => p.route === '/channels/dm-1/messages');
+    assert.ok(msgPost, 'Must create message via pure-JSON REST POST');
+    assert.equal(msgPost.body.attachments.length, 1);
+    assert.equal(msgPost.body.attachments[0].filename, 'ARCHITECTURE_ANALYSIS_58KB.md');
+    assert.equal(msgPost.body.message_reference.message_id, 'in-msg-1');
+
+    // 2. File-only reply (omitted text) via MCP JSON-RPC
+    const tinyTxt = path.join(dir, 'probe74.txt');
+    fs.writeFileSync(tinyTxt, 'x'.repeat(74));
+    const rpcFileOnly = [];
+    await handleJsonRpcMessage(
+      svc,
+      {
+        jsonrpc: '2.0',
+        id: 11,
+        method: 'tools/call',
+        params: {
+          name: 'reply',
+          arguments: {
+            chat_id: 'dm-1',
+            files: [tinyTxt],
+          },
+        },
+      },
+      (m) => rpcFileOnly.push(m),
+    );
+    assert.equal(rpcFileOnly[0].result.isError, undefined);
+    assert.match(rpcFileOnly[0].result.content[0].text, /attachments: 1\)$/);
+
+    // 3. Automatic fallback to buffered multipart ch.send when Cloud Attachments fails
+    forceCloudReserveError = true;
+    const fallbackRes = await svc.sendReply({
+      chatId: 'chan-1',
+      text: 'Fallback upload test',
+      files: [tinyTxt],
+    });
+    assert.equal(fallbackSends.length, 1);
+    assert.ok(Buffer.isBuffer(fallbackSends[0].payload.files[0].attachment), 'Fallback must pass in-memory Buffer');
+    assert.equal(fallbackSends[0].payload.files[0].attachment.length, 74);
+    assert.match(fallbackRes.message, /attachments: 1/);
+
+    // 4. Validation guards: empty text + empty files, missing file, directory path, state .env exfil
+    await assert.rejects(
+      () => svc.sendReply({ chatId: 'dm-1', text: '   ', files: [] }),
+      /requires non-empty text or at least one file/,
+    );
+    await assert.rejects(
+      () => svc.sendReply({ chatId: 'dm-1', text: 'missing', files: [path.join(dir, 'nope.txt')] }),
+      /Attachment file not found/,
+    );
+    await assert.rejects(
+      () => svc.sendReply({ chatId: 'dm-1', text: 'dir', files: [dir] }),
+      /not a regular file/,
+    );
+    await assert.rejects(
+      () => svc.sendReply({ chatId: 'dm-1', text: 'secret', files: [paths.envFile] }),
+      /Refusing to upload internal channel state file/,
+    );
+
+    await svc.shutdown();
+  } finally {
+    if (server) server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('attachments: download_attachment preserves filenames, retries transient errors, verifies SHA-256, and guards save_dir/25MB', async () => {
+  const { dir, paths } = makeTempState();
+  let cdnServer = null;
+  try {
+    saveEnvKey(paths.envFile, 'DISCORD_BOT_TOKEN', 'fake-token');
+    saveAccessState(paths.accessPath, {
+      dmPolicy: 'allowlist',
+      allowBots: true,
+      allowFrom: ['human-1'],
+      groups: {},
+    });
+
+    const configPayload = Buffer.from('{"team":"alpha","threshold":0.95}\n', 'utf8');
+    const archivePayload = crypto.randomBytes(8192);
+    let configHits = 0;
+
+    cdnServer = http.createServer((req, res) => {
+      if (req.url === '/cdn/config') {
+        configHits += 1;
+        if (configHits === 1) {
+          res.writeHead(502);
+          res.end('bad gateway');
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(configPayload);
+        return;
+      }
+      if (req.url === '/cdn/logs.tar.xz') {
+        res.writeHead(200, { 'content-type': 'application/x-xz' });
+        res.end(archivePayload);
+        return;
+      }
+      res.writeHead(404);
+      res.end('not found');
+    });
+    await new Promise((resolve) => cdnServer.listen(0, '127.0.0.1', resolve));
+    const port = cdnServer.address().port;
+
+    const fakeAttachments = new Map([
+      [
+        'att-100',
+        {
+          id: 'att-100',
+          name: 'config',
+          url: `http://127.0.0.1:${port}/cdn/config`,
+          contentType: 'application/json',
+          size: configPayload.length,
+        },
+      ],
+      [
+        'att-101',
+        {
+          id: 'att-101',
+          name: '../logs.tar.xz',
+          url: `http://127.0.0.1:${port}/cdn/logs.tar.xz`,
+          contentType: 'application/x-xz',
+          size: archivePayload.length,
+        },
+      ],
+    ]);
+
+    class DownloadTestClient {
+      constructor() {
+        this.user = { id: 'bot-1', tag: 'Bot#1' };
+        this.channels = {
+          fetch: async (id) => ({
+            id,
+            name: 'DM',
+            guildId: null,
+            type: 1,
+            recipientId: 'human-1',
+            isTextBased: () => true,
+            isThread: () => false,
+            messages: {
+              fetch: async (arg) => {
+                if (typeof arg === 'string') {
+                  return { id: arg, attachments: fakeAttachments };
+                }
+                return new Map([
+                  [
+                    'msg-with-att',
+                    {
+                      id: 'msg-with-att',
+                      content: 'attached files',
+                      author: { id: 'human-1', username: 'alice', bot: false },
+                      createdAt: new Date('2026-11-24T19:00:00Z'),
+                      attachments: fakeAttachments,
+                    },
+                  ],
+                ]);
+              },
+            },
+          }),
+        };
+      }
+      on() {}
+      async login() {
+        return 'ok';
+      }
+      async destroy() {}
+    }
+
+    const svc = createDiscordService({
+      initialConfig: loadConfig({ HOME: dir, DISCORD_STATE_DIR: paths.stateDir }),
+      logger: () => {},
+      deps: {
+        ownerAgy: null,
+        fetch: globalThis.fetch,
+        discord: {
+          Client: DownloadTestClient,
+          Events: { ClientReady: 'ready', MessageCreate: 'messageCreate' },
+          GatewayIntentBits: { DirectMessages: 1, Guilds: 2, GuildMessages: 4, MessageContent: 8 },
+          Partials: { Channel: 1 },
+        },
+        resolveSessionRoute: () => ({
+          ready: true,
+          conversationId: '056d4d74-ec64-49e0-a690-8eadf717a570',
+        }),
+      },
+    });
+    await svc.tryConnectGateway();
+
+    // History output surfaces attachment IDs and sanitized filenames
+    const hist = await svc.fetchMessages({ channelId: 'dm-1', limit: 5 });
+    assert.match(hist.formatted, /\+2att\[att-100:config \(\d+KB\), att-101:logs\.tar\.xz \(\d+KB\)\]/);
+
+    // Default inbox download + transient 502 retry + exact SHA-256 verification
+    const dlOut = [];
+    await handleJsonRpcMessage(
+      svc,
+      {
+        jsonrpc: '2.0',
+        id: 20,
+        method: 'tools/call',
+        params: {
+          name: 'download_attachment',
+          arguments: { chat_id: 'dm-1', message_id: 'msg-with-att' },
+        },
+      },
+      (m) => dlOut.push(m),
+    );
+    const dlText = dlOut[0].result.content[0].text;
+    assert.match(dlText, /downloaded 2 attachment\(s\):/);
+    assert.equal(configHits, 2, 'Transient 502 on attachment download must retry once');
+
+    const inboxFiles = fs.readdirSync(paths.inboxDir).sort();
+    assert.equal(inboxFiles.length, 2);
+    const savedConfig = inboxFiles.find((f) => f.endsWith('-att-100-config'));
+    const savedArchive = inboxFiles.find((f) => f.endsWith('-att-101-logs.tar.xz'));
+    assert.ok(savedConfig, 'Extensionless filename "config" must be preserved without appending .bin');
+    assert.ok(savedArchive, 'Path traversal "../logs.tar.xz" must sanitize to basename "logs.tar.xz"');
+    assert.equal(
+      Buffer.compare(fs.readFileSync(path.join(paths.inboxDir, savedConfig)), configPayload),
+      0,
+    );
+    assert.equal(
+      Buffer.compare(fs.readFileSync(path.join(paths.inboxDir, savedArchive)), archivePayload),
+      0,
+    );
+
+    // Custom save_dir + attachment_id filter
+    const customDir = path.join(dir, 'downloads');
+    const filteredText = await svc.downloadMessageAttachments({
+      chatId: 'dm-1',
+      messageId: 'msg-with-att',
+      saveDir: customDir,
+      attachmentId: 'att-100',
+    });
+    assert.match(filteredText, /downloaded 1 attachment\(s\):/);
+    assert.equal(fs.readdirSync(customDir).length, 1);
+
+    // State directory write guard
+    assert.throws(
+      () => assertWritableDownloadDir(paths.stateDir, paths.stateDir),
+      /Refusing to write downloaded attachments into internal state directory/,
+    );
+    assert.doesNotThrow(() => assertWritableDownloadDir(paths.inboxDir, paths.stateDir));
+
+    // Helper unit checks
+    assert.equal(sanitizeAttachmentFilename('FAG_MXFP8_ANALYSIS.md'), 'FAG_MXFP8_ANALYSIS.md');
+    assert.equal(inferMimeType('report.md'), 'text/markdown; charset=utf-8');
+    assert.equal(inferMimeType('bundle.tar.xz'), 'application/x-xz');
+
+    await svc.shutdown();
+  } finally {
+    if (cdnServer) cdnServer.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -348,7 +348,7 @@ var require_config = __commonJS({
       fs2.writeFileSync(tmp, content, { mode: 384 }), fs2.renameSync(tmp, filePath);
     }
     function loadConfig2(inputEnv = process.env) {
-      let rawInputEnv = { ...inputEnv }, env = { ...rawInputEnv }, initialPaths = resolvePaths(env), networkEnvLoaded = loadEnvFile(initialPaths.networkEnvFile, env), envLoaded = loadEnvFile(initialPaths.envFile, env), paths = resolvePaths(env), token = (env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN || "").trim(), botUserId = (env.DISCORD_BOT_USER_ID || env.DISCORD_BOT_ID || "").trim(), proxyUrl = (env.DISCORD_PROXY_URL || env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || "").trim();
+      let rawInputEnv = { ...inputEnv }, env = { ...rawInputEnv }, initialPaths = resolvePaths(env), networkEnvLoaded = loadEnvFile(initialPaths.networkEnvFile, env), envLoaded = loadEnvFile(initialPaths.envFile, env), paths = resolvePaths(env), token = (env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN || "").trim(), botUserId = (env.DISCORD_BOT_USER_ID || env.DISCORD_BOT_ID || "").trim(), proxyUrl = (env.DISCORD_PROXY_URL || env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || "").trim(), uploadModeRaw = (env.DISCORD_UPLOAD_MODE || "auto").trim().toLowerCase(), uploadMode = ["auto", "cloud", "multipart"].includes(uploadModeRaw) ? uploadModeRaw : "auto";
       return {
         rawInputEnv,
         reload: () => loadConfig2(rawInputEnv),
@@ -365,7 +365,11 @@ var require_config = __commonJS({
         loginDisabled: parseBool(env.DISCORD_CHANNEL_DISABLE_LOGIN, !1),
         staticAccess: env.DISCORD_ACCESS_MODE === "static",
         drainIntervalMs: parseInteger(env.AGY_DISCORD_DRAIN_INTERVAL_MS, 1e3),
-        envPollIntervalMs: parseInteger(env.AGY_DISCORD_ENV_POLL_MS, 3e3)
+        envPollIntervalMs: parseInteger(env.AGY_DISCORD_ENV_POLL_MS, 3e3),
+        restTimeoutMs: Math.max(5e3, parseInteger(env.DISCORD_REST_TIMEOUT_MS, 45e3)),
+        restRetries: Math.max(0, Math.min(parseInteger(env.DISCORD_REST_RETRIES, 2), 5)),
+        transferTimeoutMs: Math.max(5e3, parseInteger(env.DISCORD_TRANSFER_TIMEOUT_MS, 6e4)),
+        uploadMode
       };
     }
     module2.exports = {
@@ -1027,13 +1031,39 @@ ${quoted}`);
     }
   return banners;
 }
+function buildHookResponse(payload = {}, env = process.env, pluginRoot = path.resolve(__dirname, "..")) {
+  let config = loadConfig(env), bindRes = recordHookSessionBind(config.paths, payload, env), injectSteps = [], eventName = String(payload?.hookEventName || "");
+  if (eventName === "PreInvocation" && payload?.transcriptPath) {
+    let banners = extractNewDiscordBanners(payload.transcriptPath, config.paths.tuiEchoStatePath);
+    banners.length > 0 && injectSteps.push({
+      systemMessage: {
+        systemMessage: "",
+        metadata: {
+          user_markdown: banners.join(`
+
+`)
+        }
+      }
+    });
+  }
+  if ((eventName === "SessionStart" || eventName === "PreInvocation") && bindRes.recorded && (!bindRes.record?.lsAddress || !bindRes.record?.csrfToken)) {
+    let bindHelper = path.join(pluginRoot, "bin", "agy-discord");
+    injectSteps.push({
+      systemMessage: {
+        systemMessage: `[agy-discord-channel] Language Server credentials are not bound yet for this agy session (inbound Discord push delivery is waiting). Run \`${bindHelper} bind-hook </dev/null\` once via \`run_command\` in this turn to bind LS credentials.`
+      }
+    });
+  }
+  return injectSteps.length > 0 ? { injectSteps } : {};
+}
 function runBindHook(env = process.env) {
+  let out = {};
   try {
-    let raw = readStdinSync().trim(), payload = raw ? JSON.parse(raw) : {}, config = loadConfig(env);
-    recordHookSessionBind(config.paths, payload, env);
+    let raw = readStdinSync().trim(), payload = raw ? JSON.parse(raw) : {}, pluginRoot = env.PLUGIN_ROOT || path.resolve(__dirname, "..");
+    out = buildHookResponse(payload, env, pluginRoot);
   } catch {
   }
-  process.stdout.write(`{}
+  process.stdout.write(`${JSON.stringify(out)}
 `);
 }
 function formatStatusReport(config) {
@@ -1307,6 +1337,7 @@ function main(argv = process.argv.slice(2)) {
   throw new Error(`Unknown command: ${cmd}. Run \`agy-discord --help\`.`);
 }
 module.exports = {
+  buildHookResponse,
   extractNewDiscordBanners,
   formatStatusReport,
   main,

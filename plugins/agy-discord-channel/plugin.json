@@ -1,7 +1,7 @@
 {
   "name": "agy-discord-channel",
   "displayName": "AGY Discord Channel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Claude-Code-style session-bound Discord bot channel for Google Antigravity CLI (agy) across DMs, guild channels, and threads.",
   "logo": "assets/logo.svg",
   "license": "MIT",

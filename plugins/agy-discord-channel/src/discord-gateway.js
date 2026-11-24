@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const {
@@ -37,6 +38,48 @@ const MAX_HISTORY_OUTPUT_BYTES = 60 * 1024;
 const MAX_SINGLE_MESSAGE_CHARS = 8192;
 const RECENT_SENT_CAP = 300;
 const SHUTDOWN_STEP_TIMEOUT_MS = 4000;
+const DEFAULT_REST_TIMEOUT_MS = 45000;
+const DEFAULT_TRANSFER_TIMEOUT_MS = 60000;
+
+const MIME_BY_EXT = {
+  '.c': 'text/plain; charset=utf-8',
+  '.cc': 'text/plain; charset=utf-8',
+  '.cpp': 'text/plain; charset=utf-8',
+  '.csv': 'text/csv; charset=utf-8',
+  '.diff': 'text/x-diff; charset=utf-8',
+  '.gif': 'image/gif',
+  '.gz': 'application/gzip',
+  '.h': 'text/plain; charset=utf-8',
+  '.hpp': 'text/plain; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json',
+  '.jsonl': 'application/x-ndjson',
+  '.log': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.patch': 'text/x-diff; charset=utf-8',
+  '.pdf': 'application/pdf',
+  '.png': 'image/png',
+  '.py': 'text/x-python; charset=utf-8',
+  '.rs': 'text/plain; charset=utf-8',
+  '.sh': 'text/x-shellscript; charset=utf-8',
+  '.sql': 'text/plain; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.tar': 'application/x-tar',
+  '.tgz': 'application/gzip',
+  '.toml': 'application/toml',
+  '.ts': 'text/plain; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+  '.webp': 'image/webp',
+  '.xml': 'application/xml',
+  '.xz': 'application/x-xz',
+  '.yaml': 'application/yaml',
+  '.yml': 'application/yaml',
+  '.zip': 'application/zip',
+};
 
 function settleBounded(promiseFactory, timeoutMs = SHUTDOWN_STEP_TIMEOUT_MS) {
   let timer = null;
@@ -75,19 +118,34 @@ function configureNetwork(config, logger) {
   if (config.insecureTls) {
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
   }
+  const transferTimeoutMs = Math.max(5000, Number(config.transferTimeoutMs) || DEFAULT_TRANSFER_TIMEOUT_MS);
+  const poolTimeouts = {
+    connectTimeout: 20000,
+    headersTimeout: Math.max(45000, transferTimeoutMs),
+    bodyTimeout: Math.max(60000, transferTimeoutMs),
+    keepAliveTimeout: 10000,
+    keepAliveMaxTimeout: 30000,
+  };
+  let dispatcher = null;
   try {
     const { Agent, ProxyAgent, setGlobalDispatcher } = require('undici');
     if (config.proxyUrl) {
-      setGlobalDispatcher(
-        new ProxyAgent({
-          uri: config.proxyUrl,
-          requestTls: { rejectUnauthorized: !config.insecureTls },
-          proxyTls: { rejectUnauthorized: !config.insecureTls },
-        }),
-      );
+      dispatcher = new ProxyAgent({
+        uri: config.proxyUrl,
+        ...poolTimeouts,
+        requestTls: { rejectUnauthorized: !config.insecureTls },
+        proxyTls: { rejectUnauthorized: !config.insecureTls },
+      });
+      setGlobalDispatcher(dispatcher);
       logger('INFO', 'Configured Discord HTTP proxy');
-    } else if (config.insecureTls) {
-      setGlobalDispatcher(new Agent({ connect: { rejectUnauthorized: false } }));
+    } else {
+      dispatcher = new Agent({
+        ...poolTimeouts,
+        ...(config.insecureTls ? { connect: { rejectUnauthorized: false } } : {}),
+      });
+      if (config.insecureTls) {
+        setGlobalDispatcher(dispatcher);
+      }
     }
   } catch (err) {
     logger('WARN', 'Failed to configure Discord HTTP dispatcher', {
@@ -100,6 +158,92 @@ function configureNetwork(config, logger) {
       process.versions.bun = 'agy-discord-channel';
     } catch {}
   }
+  return dispatcher;
+}
+
+function getHttpFetch(deps = {}, dispatcher = null) {
+  if (typeof deps.fetch === 'function') return deps.fetch;
+  try {
+    const undici = require('undici');
+    if (typeof undici.fetch === 'function') {
+      return dispatcher
+        ? (url, init = {}) => undici.fetch(url, { ...init, dispatcher })
+        : undici.fetch;
+    }
+  } catch {}
+  return globalThis.fetch;
+}
+
+function isRetryableTransferError(err) {
+  if (!err) return false;
+  const name = String(err.name || '');
+  const code = String(err.code || err.cause?.code || '');
+  const msg = String(err.message || '');
+  if (name === 'AbortError' || name === 'TimeoutError') return true;
+  if (/ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT|fetch failed/i.test(`${code} ${msg}`)) {
+    return true;
+  }
+  return false;
+}
+
+async function fetchWithRetry(fetchFn, url, init = {}, timeoutMs = DEFAULT_TRANSFER_TIMEOUT_MS, maxAttempts = 2) {
+  let lastError = null;
+  const boundedTimeout = Math.max(1000, Number(timeoutMs) || DEFAULT_TRANSFER_TIMEOUT_MS);
+  for (let attempt = 1; attempt <= Math.max(1, maxAttempts); attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(new Error(`HTTP transfer timed out after ${boundedTimeout}ms`)),
+      boundedTimeout,
+    );
+    if (typeof timer?.unref === 'function') timer.unref();
+    try {
+      const res = await fetchFn(url, { ...init, signal: controller.signal });
+      if (res.status >= 500 && res.status < 600 && attempt < maxAttempts) {
+        try {
+          await res.arrayBuffer();
+        } catch {}
+        lastError = new Error(`HTTP ${res.status}`);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      const normalizedErr =
+        controller.signal.aborted && controller.signal.reason instanceof Error
+          ? controller.signal.reason
+          : err instanceof Error
+            ? err
+            : new Error(String(err));
+      lastError = normalizedErr;
+      if (attempt < maxAttempts && isRetryableTransferError(err)) {
+        continue;
+      }
+      throw normalizedErr;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError || new Error('HTTP transfer failed');
+}
+
+function inferMimeType(filePath) {
+  const lower = path.basename(String(filePath || '')).toLowerCase();
+  if (lower.endsWith('.tar.gz')) return 'application/gzip';
+  if (lower.endsWith('.tar.xz')) return 'application/x-xz';
+  const ext = path.extname(lower);
+  return MIME_BY_EXT[ext] || 'application/octet-stream';
+}
+
+function sanitizeAttachmentFilename(rawName, fallback = 'attachment.bin') {
+  const base = path.basename(String(rawName || '').trim());
+  const cleaned = base
+    .replace(/[\x00-\x1f\x7f/\\:*?"<>|;\[\]]+/g, '_')
+    .replace(/^\.+/, '')
+    .trim();
+  if (!cleaned) return fallback;
+  if (cleaned.length <= 120) return cleaned;
+  const ext = path.extname(cleaned).slice(0, 20);
+  const stem = cleaned.slice(0, Math.max(1, 120 - ext.length));
+  return `${stem}${ext}`;
 }
 
 function chunkText(text, limit = MAX_CHUNK_LIMIT, mode = 'newline') {
@@ -141,6 +285,74 @@ function assertSendableFile(filePath, stateDir) {
   }
 }
 
+function resolveRealOrNearestParent(targetPath) {
+  const abs = path.resolve(String(targetPath));
+  let cur = abs;
+  const tail = [];
+  while (!fs.existsSync(cur)) {
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    tail.unshift(path.basename(cur));
+    cur = parent;
+  }
+  const realBase = fs.existsSync(cur) ? fs.realpathSync(cur) : cur;
+  return tail.length > 0 ? path.join(realBase, ...tail) : realBase;
+}
+
+function assertWritableDownloadDir(dirPath, stateDir) {
+  if (!stateDir) return;
+  let realDir;
+  let realState;
+  try {
+    realDir = resolveRealOrNearestParent(dirPath);
+    realState = resolveRealOrNearestParent(stateDir);
+  } catch {
+    return;
+  }
+  const inboxDir = path.join(realState, 'inbox');
+  if (
+    (realDir === realState || realDir.startsWith(realState + path.sep)) &&
+    realDir !== inboxDir &&
+    !realDir.startsWith(inboxDir + path.sep)
+  ) {
+    throw new Error(`Refusing to write downloaded attachments into internal state directory: ${dirPath}`);
+  }
+}
+
+function prepareUploadFiles(files, stateDir) {
+  const rawList = Array.isArray(files) ? files.filter((f) => f !== undefined && f !== null && String(f).trim() !== '') : [];
+  if (rawList.length > 10) {
+    throw new Error('Discord allows at most 10 attachments per message');
+  }
+  return rawList.map((rawPath, index) => {
+    const filePath = path.resolve(String(rawPath));
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Attachment file not found: ${rawPath}`);
+    }
+    assertSendableFile(filePath, stateDir);
+    const st = fs.statSync(filePath);
+    if (!st.isFile()) {
+      throw new Error(`Attachment path is not a regular file: ${rawPath}`);
+    }
+    if (st.size > MAX_ATTACHMENT_BYTES) {
+      throw new Error(`Attachment exceeds 25MB limit: ${rawPath}`);
+    }
+    const buffer = fs.readFileSync(filePath);
+    if (buffer.length > MAX_ATTACHMENT_BYTES) {
+      throw new Error(`Attachment exceeds 25MB limit: ${rawPath}`);
+    }
+    const name = sanitizeAttachmentFilename(path.basename(filePath), `attachment-${index + 1}.bin`);
+    return {
+      index,
+      filePath,
+      name,
+      size: buffer.length,
+      contentType: inferMimeType(name),
+      buffer,
+    };
+  });
+}
+
 function discordCacheOptions(discord) {
   const Options = discord?.Options;
   if (!Options || typeof Options.cacheWithLimits !== 'function') return {};
@@ -177,10 +389,18 @@ function normalizeDiscordJsMessage(msg, referencedMsg, botUserId, recentSentIds)
   const mentionedRoleIds = msg.mentions?.roles
     ? Array.from(msg.mentions.roles.keys()).map(String)
     : [];
+  const contentStr = String(msg.content || '');
+  const contentMentionsBot = Boolean(
+    botUserId && (contentStr.includes(`<@${botUserId}>`) || contentStr.includes(`<@!${botUserId}>`)),
+  );
+  // Ignore Discord's implicit repliedUser mention on quote-replies unless <@botUserId> is in content
   const mentionsBotUser = Boolean(
-    botUserId && msg.mentions?.users && typeof msg.mentions.users.has === 'function'
-      ? msg.mentions.users.has(botUserId)
-      : false,
+    contentMentionsBot ||
+      (!refId &&
+        botUserId &&
+        msg.mentions?.users &&
+        typeof msg.mentions.users.has === 'function' &&
+        msg.mentions.users.has(botUserId)),
   );
   const attachments = msg.attachments
     ? Array.from(msg.attachments.values()).map((att) => ({
@@ -222,6 +442,7 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
   const recentSentIds = new Set();
 
   let client = null;
+  let httpDispatcher = null;
   let myLockRecord = null;
   let gatewayState = {
     started: false,
@@ -469,7 +690,7 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
     gatewayState.receiverOwned = true;
     gatewayState.receiverHolder = lock.holder;
 
-    configureNetwork(config, logger);
+    httpDispatcher = configureNetwork(config, logger);
     const discord = deps.discord || require('discord.js');
     const { Client, Events, GatewayIntentBits, Partials } = discord;
 
@@ -485,6 +706,10 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
     const nextClient = new Client({
       intents,
       partials: [Partials.Channel],
+      rest: {
+        timeout: Math.max(5000, Number(config.restTimeoutMs) || DEFAULT_REST_TIMEOUT_MS),
+        retries: Math.max(0, Math.min(Number(config.restRetries ?? 2), 5)),
+      },
       ...discordCacheOptions(discord),
     });
 
@@ -578,6 +803,11 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
       client = null;
       await settleBounded(() => toClose.destroy(), SHUTDOWN_STEP_TIMEOUT_MS);
     }
+    if (httpDispatcher && typeof httpDispatcher.close === 'function') {
+      const dispatcherToClose = httpDispatcher;
+      httpDispatcher = null;
+      await settleBounded(() => dispatcherToClose.close(), 1000);
+    }
   }
 
   function requireConnectedClient() {
@@ -610,6 +840,92 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
     return { ch, access, botId, source: check.source };
   }
 
+  async function uploadAndSendCloudChunk({
+    activeClient,
+    channelId,
+    content,
+    preparedFiles,
+    replyTo,
+    useReplyRef,
+  }) {
+    const httpFetch = getHttpFetch(deps, httpDispatcher);
+    const transferTimeoutMs = Math.max(5000, Number(config.transferTimeoutMs) || DEFAULT_TRANSFER_TIMEOUT_MS);
+
+    const reserve = await activeClient.rest.post(`/channels/${channelId}/attachments`, {
+      body: {
+        files: preparedFiles.map((f, idx) => ({
+          id: idx,
+          filename: f.name,
+          file_size: f.size,
+        })),
+      },
+    });
+
+    const slots = Array.isArray(reserve?.attachments) ? reserve.attachments : [];
+    if (slots.length !== preparedFiles.length) {
+      throw new Error(
+        `Discord Cloud Attachments returned ${slots.length} upload slot(s) for ${preparedFiles.length} file(s)`,
+      );
+    }
+
+    const uploadedRefs = [];
+    for (let idx = 0; idx < preparedFiles.length; idx++) {
+      const file = preparedFiles[idx];
+      const slot = slots.find((s) => Number(s.id) === idx) || slots[idx];
+      if (!slot?.upload_url || !slot?.upload_filename) {
+        throw new Error(`Missing upload_url or upload_filename for attachment ${file.name}`);
+      }
+      const putRes = await fetchWithRetry(
+        httpFetch,
+        slot.upload_url,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': file.contentType,
+            'Content-Length': String(file.size),
+          },
+          body: file.buffer,
+        },
+        transferTimeoutMs,
+        2,
+      );
+      if (!putRes.ok) {
+        throw new Error(`HTTP ${putRes.status} uploading attachment ${file.name} to Discord storage`);
+      }
+      uploadedRefs.push({
+        id: String(idx),
+        filename: file.name,
+        uploaded_filename: slot.upload_filename,
+      });
+    }
+
+    const messageBody = {
+      ...(content ? { content } : {}),
+      tts: false,
+      attachments: uploadedRefs,
+      ...(useReplyRef
+        ? {
+            message_reference: {
+              message_id: String(replyTo),
+              fail_if_not_exists: false,
+            },
+            allowed_mentions: {
+              parse: ['users', 'roles', 'everyone'],
+              replied_user: false,
+            },
+          }
+        : {}),
+    };
+
+    const created = await activeClient.rest.post(`/channels/${channelId}/messages`, {
+      body: messageBody,
+    });
+    if (!created?.id) {
+      throw new Error('Discord message creation after attachment upload returned no message ID');
+    }
+    return { id: String(created.id) };
+  }
+
   async function sendReply({
     chatId,
     text,
@@ -618,6 +934,7 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
     followup = false,
     enforceReceipt = true,
   }) {
+    const activeClient = requireConnectedClient();
     const { ch, access } = await fetchAllowedChannel(chatId);
     if (typeof ch.send !== 'function') {
       throw new Error(`Discord channel ${chatId} is not sendable`);
@@ -634,22 +951,16 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
       }
     }
 
-    const uploadFiles = Array.isArray(files) ? files : [];
-    if (uploadFiles.length > 10) {
-      throw new Error('Discord allows at most 10 attachments per message');
-    }
-    for (const f of uploadFiles) {
-      assertSendableFile(f, config.paths.stateDir);
-      const st = fs.statSync(f);
-      if (st.size > MAX_ATTACHMENT_BYTES) {
-        throw new Error(`Attachment exceeds 25MB limit: ${f}`);
-      }
+    const preparedFiles = prepareUploadFiles(files, config.paths.stateDir);
+    const bodyText = String(text ?? '');
+    if (bodyText.trim().length === 0 && preparedFiles.length === 0) {
+      throw new Error('reply requires non-empty text or at least one file in files');
     }
 
-    const bodyText = String(text ?? '');
     const limit = Math.max(100, Math.min(access.textChunkLimit || MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT));
-    const chunks = chunkText(bodyText, limit, access.chunkMode || 'newline');
+    const chunks = bodyText.length > 0 ? chunkText(bodyText, limit, access.chunkMode || 'newline') : [''];
     const replyMode = access.replyToMode || 'first';
+    const uploadMode = config.uploadMode || 'auto';
     const sentIds = [];
 
     for (let i = 0; i < chunks.length; i++) {
@@ -657,13 +968,55 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
         Boolean(replyTo) &&
         replyMode !== 'off' &&
         (replyMode === 'all' || i === 0);
-      const sent = await ch.send({
-        content: chunks[i],
-        ...(i === 0 && uploadFiles.length > 0 ? { files: uploadFiles } : {}),
-        ...(useReplyRef
-          ? { reply: { messageReference: String(replyTo), failIfNotExists: false } }
-          : {}),
-      });
+      const chunkContent = chunks[i];
+      const attachNow = i === 0 && preparedFiles.length > 0;
+
+      let sent = null;
+      if (
+        attachNow &&
+        uploadMode !== 'multipart' &&
+        typeof activeClient?.rest?.post === 'function'
+      ) {
+        try {
+          sent = await uploadAndSendCloudChunk({
+            activeClient,
+            channelId: String(ch.id),
+            content: chunkContent,
+            preparedFiles,
+            replyTo,
+            useReplyRef,
+          });
+        } catch (cloudErr) {
+          if (uploadMode === 'cloud') {
+            throw cloudErr;
+          }
+          logger('WARN', 'Discord Cloud Attachments upload failed; falling back to buffered multipart send', {
+            channelId: String(ch.id),
+            error: cloudErr instanceof Error ? cloudErr.message : String(cloudErr),
+          });
+        }
+      }
+
+      if (!sent) {
+        const multipartFiles = attachNow
+          ? preparedFiles.map((f) => ({
+              attachment: f.buffer,
+              name: f.name,
+              contentType: f.contentType,
+            }))
+          : undefined;
+        sent = await ch.send({
+          ...(chunkContent ? { content: chunkContent } : {}),
+          ...(multipartFiles ? { files: multipartFiles } : {}),
+          ...(useReplyRef
+            ? {
+                reply: { messageReference: String(replyTo), failIfNotExists: false },
+                allowedMentions: { parse: ['users', 'roles', 'everyone'], repliedUser: false },
+              }
+            : {}),
+        });
+      }
+
       noteSent(sent.id);
       sentIds.push(String(sent.id));
     }
@@ -672,13 +1025,15 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
       recordReplyReceipt(config.paths, String(ch.id), String(replyTo), sentIds, bodyText);
     }
 
+    const attSuffix = preparedFiles.length > 0 ? `, attachments: ${preparedFiles.length}` : '';
     return {
       duplicateSuppressed: false,
       sentIds,
+      attachmentCount: preparedFiles.length,
       message:
         sentIds.length === 1
-          ? `sent (id: ${sentIds[0]})`
-          : `sent ${sentIds.length} chunks (ids: ${sentIds.join(', ')})`,
+          ? `sent (id: ${sentIds[0]}${attSuffix})`
+          : `sent ${sentIds.length} chunks (ids: ${sentIds.join(', ')}${attSuffix})`,
     };
   }
 
@@ -716,7 +1071,15 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
       const botBadge = m.author?.bot && !isMe ? '[bot]' : '';
       const who = isMe ? `me(${m.author?.username || botId})` : `${m.author?.username || m.author?.id}${botBadge}`;
       const ref = m.reference?.messageId ? ` [reply_to:${m.reference.messageId}]` : '';
-      const atts = m.attachments?.size > 0 ? ` +${m.attachments.size}att` : '';
+      let atts = '';
+      if (m.attachments?.size > 0) {
+        const items = Array.from(m.attachments.values()).map((a) => {
+          const safe = sanitizeAttachmentFilename(a.name || a.id, String(a.id));
+          const kb = Math.max(1, Math.round((Number(a.size) || 0) / 1024));
+          return `${a.id}:${safe} (${kb}KB)`;
+        });
+        atts = ` +${m.attachments.size}att[${items.join(', ')}]`;
+      }
       const rawContent = sanitizeControlChars(String(m.content || '')).slice(0, MAX_SINGLE_MESSAGE_CHARS);
       const cleanText = rawContent.replace(/[\r\n]+/g, ' ⏎ ');
       const line = `[${m.createdAt.toISOString()}] ${who} (user_id:${m.author?.id}): ${cleanText}${ref}  (id: ${m.id}${atts})`;
@@ -755,28 +1118,77 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
     return `edited (id: ${edited.id})`;
   }
 
-  async function downloadMessageAttachments({ chatId, messageId }) {
+  async function downloadMessageAttachments({
+    chatId,
+    messageId,
+    saveDir,
+    attachmentId,
+    filename,
+  }) {
     const { ch } = await fetchAllowedChannel(chatId);
     const msg = await ch.messages.fetch(String(messageId));
     if (!msg.attachments || msg.attachments.size === 0) {
       return 'message has no attachments';
     }
-    fs.mkdirSync(config.paths.inboxDir, { recursive: true, mode: 0o700 });
+
+    const targetDir = saveDir ? path.resolve(String(saveDir)) : config.paths.inboxDir;
+    assertWritableDownloadDir(targetDir, config.paths.stateDir);
+    fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+
+    const allAttachments = Array.from(msg.attachments.values());
+    const wantedId = attachmentId ? String(attachmentId).trim() : '';
+    const wantedName = filename ? String(filename).trim() : '';
+    const selected = allAttachments.filter((att) => {
+      if (wantedId && String(att.id) !== wantedId) return false;
+      if (wantedName && String(att.name || '') !== wantedName) return false;
+      return true;
+    });
+
+    if (selected.length === 0) {
+      const available = allAttachments
+        .map((att) => `${att.id}:${sanitizeAttachmentFilename(att.name || att.id)}`)
+        .join(', ');
+      throw new Error(
+        `No matching attachment on message ${messageId} (available: ${available || 'none'})`,
+      );
+    }
+
+    const httpFetch = getHttpFetch(deps, httpDispatcher);
+    const transferTimeoutMs = Math.max(5000, Number(config.transferTimeoutMs) || DEFAULT_TRANSFER_TIMEOUT_MS);
     const out = [];
-    for (const att of msg.attachments.values()) {
-      if (att.size > MAX_ATTACHMENT_BYTES) {
+
+    for (const att of selected) {
+      if (Number(att.size) > MAX_ATTACHMENT_BYTES) {
         throw new Error(`Attachment too large (${(att.size / 1024 / 1024).toFixed(1)}MB > 25MB)`);
       }
-      const res = await fetch(att.url);
-      if (!res.ok) throw new Error(`HTTP ${res.status} downloading attachment ${att.id}`);
+      if (!att.url) {
+        throw new Error(`Attachment ${att.id} has no download URL`);
+      }
+      const res = await fetchWithRetry(
+        httpFetch,
+        att.url,
+        { method: 'GET' },
+        transferTimeoutMs,
+        2,
+      );
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} downloading attachment ${att.id}`);
+      }
       const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length > MAX_ATTACHMENT_BYTES) {
+        throw new Error(
+          `Downloaded attachment exceeds 25MB limit (${(buf.length / 1024 / 1024).toFixed(1)}MB > 25MB)`,
+        );
+      }
       const rawName = String(att.name || att.id);
-      const extMatch = /\.([A-Za-z0-9]{1,10})$/.exec(rawName);
-      const ext = extMatch ? extMatch[1] : 'bin';
-      const dest = path.join(config.paths.inboxDir, `${Date.now()}-${att.id}.${ext}`);
-      fs.writeFileSync(dest, buf, { mode: 0o600 });
-      const safeName = rawName.replace(/[\[\]\r\n;]/g, '_');
-      out.push(`  ${dest}  (${safeName}, ${att.contentType || 'unknown'}, ${Math.round(att.size / 1024)}KB)`);
+      const safeFile = sanitizeAttachmentFilename(rawName, `${att.id}.bin`);
+      const dest = path.join(targetDir, `${Date.now()}-${att.id}-${safeFile}`);
+      writeFileAtomicDurable(dest, buf, 0o600);
+      const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+      const mediaType = att.contentType || inferMimeType(safeFile);
+      out.push(
+        `  ${dest}  (${safeFile}, ${mediaType}, ${buf.length}B, sha256:${sha256.slice(0, 16)})`,
+      );
     }
     return `downloaded ${out.length} attachment(s):\n${out.join('\n')}`;
   }
@@ -854,9 +1266,13 @@ function createDiscordService({ initialConfig, logger, deps = {} }) {
 
 module.exports = {
   assertSendableFile,
+  assertWritableDownloadDir,
   chunkText,
   createDiscordService,
   gatewayResourceSnapshot,
+  inferMimeType,
   normalizeDiscordJsMessage,
+  prepareUploadFiles,
+  sanitizeAttachmentFilename,
   settleBounded,
 };

@@ -13,17 +13,18 @@ This Antigravity CLI session is bound to a single Discord bot instance via the `
   * Pass `chat_id` back to `reply(chat_id, text, reply_to?)`.
   * In **shared multi-agent guild channels**, pass `reply_to: message_id` so your response threads cleanly under the triggering message. In **1-on-1 DMs or dedicated threads**, `reply_to` is optional unless answering an older message.
 * **Attachments & Progress:**
-  * Inbound attachments are listed in the `attachments` attribute (not auto-downloaded). Call `download_attachment(chat_id, message_id)` when you need to inspect them.
-  * Pass `files: ["/abs/path/to/file"]` to `reply` to upload images, logs, or artifacts.
+  * Inbound attachments are listed in the `attachments` attribute (not auto-downloaded). Call `download_attachment(chat_id, message_id, save_dir?)` when you need to inspect them locally.
+  * Pass `files: ["/abs/path/to/file"]` to `reply` to upload images, logs, patches, or markdown artifacts (up to 10 files, 25 MB each; `text` may be empty when sending file-only attachments).
   * Use `react` for lightweight acknowledgments and `edit_message` for interim progress updates on long-running builds/benchmarks, followed by a fresh `reply` when complete so notifications fire.
-  * Use `fetch_messages(channel, limit)` whenever you need surrounding thread/channel context before answering.
+  * Use `fetch_messages(channel, limit)` whenever you need surrounding thread/channel context or readback verification before answering.
 
 ## 2. Collaborating with Peer Agent Bots
 
 * Inbound messages with `is_bot="true"` come from peer AI agents in the Discord server (e.g., Claude Code or Codex agents).
-* **Prevent chatter loops:**
+* **Prevent chatter loops & dropped wakeups:**
   * Only reply to a peer bot when you have concrete technical input, a requested deliverable, or a direct answer. Do **not** send empty "acknowledged / thanks" messages back and forth with another bot.
   * Peer bots require an explicit `<@USER_ID>` (or `<@&ROLE_ID>`) mention in your message text if you want to wake/trigger them; omit `@mention` when posting passive status notes that shouldn't force another bot turn.
+  * Keep peer-bot wakeup messages **under ~1800 characters** (or attach long reports via `files: [...]`), because Discord splits messages over 2000 characters and continuation chunks without `<@USER_ID>` are ignored by peer bots' anti-loop filters.
 
 ## 3. Security & Prompt-Injection Boundary
 

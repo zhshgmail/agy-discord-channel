@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: agy-discord-instance INSTANCE [-C WORKSPACE_DIR] [AGY_ARGS...]" >&2
+}
+
+if (($# < 1)); then
+  usage
+  exit 2
+fi
+
+instance=$1
+shift
+if [[ ! $instance =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+  echo "Invalid Discord instance: $instance" >&2
+  exit 2
+fi
+
+# Save and restore terminal stty settings on exit in case the TUI exits in raw mode.
+terminal_state=''
+if [[ -t 0 ]]; then
+  terminal_state=$(stty -g 2>/dev/null || true)
+fi
+restore_terminal() {
+  if [[ -n $terminal_state ]]; then
+    stty "$terminal_state" <&0 2>/dev/null || true
+  fi
+}
+trap restore_terminal EXIT
+
+launcher_path=$(readlink -f "${BASH_SOURCE[0]}")
+plugin_root=$(dirname "$(dirname "$launcher_path")")
+bind_cli="$plugin_root/bin/agy-discord"
+
+resolve_agy() {
+  if [[ -n ${AGY_BIN:-} && -x ${AGY_BIN} ]]; then
+    printf '%s\n' "$AGY_BIN"
+    return 0
+  fi
+  if command -v agy >/dev/null 2>&1; then
+    command -v agy
+    return 0
+  fi
+  if [[ -x "$HOME/.local/bin/agy" ]]; then
+    printf '%s\n' "$HOME/.local/bin/agy"
+    return 0
+  fi
+  echo "agy-discord-instance: agy executable not found in PATH or ~/.local/bin/agy" >&2
+  exit 1
+}
+
+resolve_node() {
+  if [[ -n ${NODE_BIN:-} && -x ${NODE_BIN} ]]; then
+    printf '%s\n' "$NODE_BIN"
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    command -v node
+    return 0
+  fi
+  local last_node=""
+  local candidate
+  for candidate in "$HOME"/.nvm/versions/node/*/bin/node /usr/local/bin/node /usr/bin/node; do
+    if [[ -x $candidate ]]; then
+      last_node=$candidate
+    fi
+  done
+  if [[ -n $last_node ]]; then
+    printf '%s\n' "$last_node"
+    return 0
+  fi
+  echo "agy-discord-instance: node executable not found" >&2
+  exit 1
+}
+
+agy_bin=$(resolve_agy)
+node_bin=$(resolve_node)
+gemini_home=${GEMINI_HOME:-"$HOME/.gemini"}
+state_dir="$gemini_home/channels/discord/$instance"
+env_file="$state_dir/.env"
+lock_file="$state_dir/receiver.lock.json"
+
+if [[ ! -f $env_file ]] || ! grep -Eq '^(export[[:space:]]+)?DISCORD_(BOT_)?TOKEN=[^[:space:]]+' "$env_file"; then
+  echo "Missing Discord bot token for instance '$instance' in $env_file" >&2
+  echo "Configure it first with: DISCORD_INSTANCE=$instance $bind_cli configure \"<DISCORD_BOT_TOKEN>\"" >&2
+  exit 1
+fi
+
+# Refuse to start a duplicate session if a live agy gateway already holds this instance lock.
+if [[ -f $lock_file ]]; then
+  holder_status=$("$node_bin" -e '
+    const fs = require("node:fs");
+    const lockPath = process.argv[1];
+    try {
+      const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      const pid = Number(lock.mcpPid);
+      if (!Number.isInteger(pid) || pid <= 0) process.exit(0);
+      const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const closeIdx = raw.lastIndexOf(")");
+      const fields = raw.slice(closeIdx + 2).trim().split(/\s+/);
+      const startTicks = fields[19] || "";
+      if (!lock.mcpStartTicks || !startTicks || String(lock.mcpStartTicks) === startTicks) {
+        console.log(`alive:${pid}:${lock.ownerAgyPid || "unknown"}`);
+      }
+    } catch {}
+  ' "$lock_file")
+  if [[ $holder_status == alive:* ]]; then
+    IFS=: read -r _ live_mcp_pid live_agy_pid <<<"$holder_status"
+    echo "Discord instance '$instance' is already owned by a live Antigravity session (agy PID: $live_agy_pid, mcp PID: $live_mcp_pid)." >&2
+    echo "Exit that session first before launching another '$instance' console." >&2
+    exit 73
+  fi
+fi
+
+workdir=""
+has_prompt_flag=0
+has_skip_perms=0
+agy_args=()
+
+while (($# > 0)); do
+  case $1 in
+    -C|--cd)
+      if (($# < 2)); then
+        echo "Option $1 requires a directory argument" >&2
+        exit 2
+      fi
+      workdir=$2
+      shift 2
+      ;;
+    -p|--print|--prompt|-i|--prompt-interactive)
+      has_prompt_flag=1
+      agy_args+=("$1")
+      if (($# >= 2)); then
+        agy_args+=("$2")
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    -p=*|--print=*|--prompt=*|-i=*|--prompt-interactive=*)
+      has_prompt_flag=1
+      agy_args+=("$1")
+      shift
+      ;;
+    --dangerously-skip-permissions)
+      has_skip_perms=1
+      agy_args+=("$1")
+      shift
+      ;;
+    --)
+      shift
+      while (($# > 0)); do
+        agy_args+=("$1")
+        shift
+      done
+      ;;
+    *)
+      agy_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -n $workdir ]]; then
+  if [[ ! -d $workdir ]]; then
+    echo "Workspace directory does not exist: $workdir" >&2
+    exit 1
+  fi
+  cd "$workdir"
+fi
+
+if ((has_skip_perms == 0)); then
+  agy_args=(--dangerously-skip-permissions "${agy_args[@]}")
+fi
+
+# Bootstrap the conversation + LS credential binding automatically on startup so
+# inbound Discord messages wake the session immediately without manual typing.
+if ((has_prompt_flag == 0)); then
+  bootstrap_prompt="Run \`$bind_cli bind-hook </dev/null\` via run_command once to bind this session's Language Server credentials for Discord instance '$instance', check \`discord_status\`, and reply with a single compact ready line."
+  agy_args+=(-i "$bootstrap_prompt")
+fi
+
+# Clear any inherited Discord/Antigravity session variables from parent shells.
+child_env_unsets=()
+while IFS= read -r name; do
+  case $name in
+    DISCORD_*|AGY_DISCORD_*|ANTIGRAVITY_CONVERSATION_ID|ANTIGRAVITY_LS_ADDRESS|ANTIGRAVITY_CSRF_TOKEN)
+      child_env_unsets+=(-u "$name")
+      ;;
+  esac
+done < <(compgen -e)
+
+env \
+  "${child_env_unsets[@]}" \
+  DISCORD_INSTANCE="$instance" \
+  DISCORD_STATE_DIR="$state_dir" \
+  "$agy_bin" "${agy_args[@]}"

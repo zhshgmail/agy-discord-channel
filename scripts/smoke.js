@@ -39,10 +39,19 @@ for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
   assert.ok(!Object.hasOwn(pkg.scripts || {}, lifecycle), `package.json must not rely on ${lifecycle}`);
 }
 
-for (const relExec of ['bin/agy-discord', 'bin/agy-discord-mcp', 'hooks/session-bind.sh']) {
+for (const relExec of [
+  'bin/agy-discord',
+  'bin/agy-discord-mcp',
+  'bin/agy-discord-instance',
+  'hooks/session-bind.sh',
+]) {
   const full = path.join(pluginRoot, relExec);
   assert.ok(fs.existsSync(full), `missing executable ${relExec}`);
   assert.notEqual(fs.statSync(full).mode & 0o111, 0, `${relExec} must be executable`);
+}
+
+for (const relDoc of ['README.md', 'README.zh-CN.md', 'AGENT_GUIDE.md']) {
+  assert.ok(fs.existsSync(path.join(repoRoot, relDoc)), `missing ${relDoc} in repo root`);
 }
 
 for (const relBundle of [
